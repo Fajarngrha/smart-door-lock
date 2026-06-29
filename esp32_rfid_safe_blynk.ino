@@ -26,6 +26,7 @@ constexpr unsigned long UNLOCK_DURATION_MS = 5000; // Delay Terbuka
 constexpr unsigned long LOCKOUT_DURATION_MS = 30000; // Lama blokir akses
 constexpr unsigned long RFID_SCAN_COOLDOWN_MS = 400;
 constexpr unsigned long RFID_HEALTHCHECK_INTERVAL_MS = 3000;
+constexpr unsigned long DENIED_REPEAT_IGNORE_MS = 3000;
 constexpr uint8_t MAX_FAILED_ATTEMPTS = 3; // Batas salah tap sebelum masuk mode lockout
 constexpr size_t MAX_UIDS = 20; // Maksimum jumlah UID whitelist yang disimpan.
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -42,6 +43,8 @@ unsigned long lastScanAt = 0;
 unsigned long lastRfidHealthcheckAt = 0;
 unsigned long lockoutUntil = 0;
 uint8_t failedAttempts = 0;
+String lastDeniedUid = "";
+unsigned long lastDeniedAt = 0;
 bool wifiLoggedConnected = false;
 bool blynkLoggedConnected = false;
 unsigned long lastWifiRetryAt = 0;
@@ -324,7 +327,18 @@ void setLock(bool open) {
 
 void failAccess(const String &uid, const String &message, const String &eventMessage) {
   playDeniedSound();
-  failedAttempts++;
+
+  bool countAsNewFailedAttempt = true;
+  if (uid == lastDeniedUid && (millis() - lastDeniedAt) < DENIED_REPEAT_IGNORE_MS) {
+    countAsNewFailedAttempt = false;
+  }
+
+  if (countAsNewFailedAttempt) {
+    failedAttempts++;
+    lastDeniedUid = uid;
+    lastDeniedAt = millis();
+  }
+
   if (Blynk.connected()) {
     Blynk.virtualWrite(V4, message);
     Blynk.logEvent("akses_ditolak", eventMessage);
@@ -338,6 +352,24 @@ void failAccess(const String &uid, const String &message, const String &eventMes
       Blynk.virtualWrite(V4, "LOCKOUT 30 detik karena terlalu banyak gagal.");
       Blynk.logEvent("akses_ditolak", "Lockout aktif 30 detik karena percobaan gagal berulang.");
     }
+  }
+}
+
+void notifyLockoutAttempt(const String &uid) {
+  unsigned long remainMs = lockoutUntil > millis() ? (lockoutUntil - millis()) : 0;
+  unsigned long remainSec = (remainMs + 999) / 1000;
+
+  Serial.print("LOCKOUT aktif, sisa ");
+  Serial.print(remainSec);
+  Serial.println(" detik.");
+
+  playDeniedSound();
+
+  if (Blynk.connected()) {
+    String msg = "Akses diblokir sementara. Coba lagi " + String(remainSec) + " detik.";
+    Blynk.virtualWrite(V4, msg);
+    Blynk.logEvent("akses_ditolak", "Percobaan saat lockout aktif UID: " + uid);
+    sendAccessCardToDashboard("ditolak", uid);
   }
 }
 
@@ -357,7 +389,7 @@ void handleRFID() {
   Serial.println(uid);
 
   if (millis() < lockoutUntil) {
-    failAccess(uid, "Akses diblokir sementara (lockout aktif).", "Percobaan saat lockout aktif UID: " + uid);
+    notifyLockoutAttempt(uid);
     resetRfidAfterRead();
     return;
   }
@@ -378,6 +410,8 @@ void handleRFID() {
     setLock(true);
     unlockStartedAt = millis();
     failedAttempts = 0;
+    lastDeniedUid = "";
+    lastDeniedAt = 0;
   } else {
     Serial.println("Akses ditolak.");
     Serial.print("UID ");
